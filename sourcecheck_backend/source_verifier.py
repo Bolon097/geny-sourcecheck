@@ -20,9 +20,26 @@ SOURCE_WORDS = [
     "引用",
 ]
 
+KNOWN_NAMED_SOURCES = [
+    "杭州市政府网",
+    "杭州市人民政府门户网站",
+    "杭州数据开放平台",
+    "浙江省公共数据开放平台",
+    "杭州市城乡建设委员会",
+    "杭州市发展和改革委员会",
+    "杭州市交通运输局",
+    "杭州市统计局",
+    "Hangzhou municipal government platform",
+    "Amap",
+    "Amap charging platform",
+    "Baidu Maps",
+    "WeChat mini-program",
+]
+
 URL_RE = re.compile(r"https?://[^\s<>'\"`，。；、（）()\[\]{}]+", re.IGNORECASE)
+HTTPS_URL_RE = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
 DOI_RE = re.compile(
-    r"(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)?(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
+    r"(?:doi\s*:\s*)?(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
     re.IGNORECASE,
 )
 COMMON_TLDS = (
@@ -53,29 +70,34 @@ DOMAIN_RE = re.compile(
 TRIM_CHARS = " \t\r\n<>[](){}（）【】「」『』“”‘’\"'`.,;:，。；：、！!？?）]】"
 REQUEST_TIMEOUT_SECONDS = 10
 USER_AGENT = "SourceCheck/0.1 local verification prototype"
+NOT_CHECKED_REASON = (
+    "Level 2 only checks explicit HTTP/HTTPS URLs and DOI references in this prototype."
+)
 
 
 def clean_token(value: str) -> str:
     return html.unescape(value).strip(TRIM_CHARS)
 
 
-def normalize_url(raw: str, default_scheme: str = "https") -> str:
+def extract_https_urls(text: str) -> List[str]:
+    """Return only URLs that explicitly start with https://."""
+    return [clean_token(match.group(0)) for match in HTTPS_URL_RE.finditer(text)]
+
+
+def normalize_url(raw: str) -> str:
     cleaned = clean_token(raw)
     if not cleaned:
         return ""
-    if not re.match(r"^https?://", cleaned, re.IGNORECASE):
-        cleaned = f"{default_scheme}://{cleaned}"
     parsed = urlparse(cleaned)
     if not parsed.netloc:
         return cleaned
-    scheme = parsed.scheme.lower() if parsed.scheme.lower() in ("http", "https") else default_scheme
+    scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
     return urlunparse((scheme, netloc, parsed.path, "", parsed.query, parsed.fragment))
 
 
 def _url_dedupe_key(source: str) -> str:
-    candidate = source if re.match(r"^https?://", source, re.IGNORECASE) else f"https://{source}"
-    parsed = urlparse(candidate)
+    parsed = urlparse(source)
     if not parsed.netloc:
         return source.lower().rstrip("/")
     netloc = parsed.netloc.lower()
@@ -85,6 +107,10 @@ def _url_dedupe_key(source: str) -> str:
 
 def _is_https_url(source: str) -> bool:
     return source.lower().startswith("https://")
+
+
+def _is_explicit_http_url(source: str) -> bool:
+    return source.lower().startswith(("http://", "https://"))
 
 
 def normalize_doi(raw: str) -> str:
@@ -100,9 +126,19 @@ def source_words_present(text: str) -> bool:
     return any(word.lower() in lowered for word in SOURCE_WORDS)
 
 
+def _is_machine_checkable(source_type: str, source: str) -> bool:
+    if source_type == "url":
+        return _is_explicit_http_url(source)
+    if source_type == "doi":
+        return _is_https_url(source)
+    return False
+
+
 def _dedupe_key(source_type: str, source: str) -> str:
-    if source_type in ("url", "bare_domain"):
+    if source_type == "url":
         return f"url:{_url_dedupe_key(source)}"
+    if source_type == "doi":
+        return f"doi:{source.lower().rstrip('/')}"
     return f"{source_type}:{source.lower().rstrip('/')}"
 
 
@@ -112,26 +148,40 @@ def extract_sources(text: str) -> List[Dict[str, Any]]:
     url_spans = []
 
     def add_source(raw: str, source: str, source_type: str) -> None:
-        source = normalize_url(source) if source_type in ("url", "bare_domain") else clean_token(source)
+        source = normalize_url(source) if source_type in ("url", "doi") else clean_token(source)
         if not source:
             return
         key = _dedupe_key(source_type, source)
         if key in seen:
             existing = sources[seen[key]]
-            if _is_https_url(source) and not _is_https_url(str(existing["source"])):
+            if source_type == "doi" and existing["source_type"] != "doi":
                 existing.update({"raw": raw, "source": source, "source_type": source_type})
+                existing["is_machine_checkable"] = True
+                existing["reason"] = ""
+            elif source_type == "url" and _is_https_url(source) and not _is_https_url(str(existing["source"])):
+                existing.update({"raw": raw, "source": source, "source_type": source_type})
+                existing["is_machine_checkable"] = True
+                existing["reason"] = ""
+            elif _is_machine_checkable(source_type, source) and not existing.get("is_machine_checkable"):
+                existing.update({"raw": raw, "source": source, "source_type": source_type})
+                existing["is_machine_checkable"] = True
+                existing["reason"] = ""
             return
+        is_machine_checkable = _is_machine_checkable(source_type, source)
         seen[key] = len(sources)
         sources.append(
             {
                 "raw": raw,
                 "source": source,
                 "source_type": source_type,
+                "is_machine_checkable": is_machine_checkable,
+                "level1_status": "source_signal_detected",
                 "level2_status": "not_checked",
                 "http_status": None,
                 "attempt_url": None,
                 "final_url": None,
                 "error": None,
+                "reason": "" if is_machine_checkable else NOT_CHECKED_REASON,
             }
         )
 
@@ -160,6 +210,13 @@ def extract_sources(text: str) -> List[Dict[str, Any]]:
         if "doi.org/" in lowered:
             continue
         add_source(raw, cleaned, "bare_domain")
+
+    for name in KNOWN_NAMED_SOURCES:
+        if name in text:
+            add_source(name, name, "named_source")
+
+    if source_words_present(text) and not sources:
+        add_source("source-related wording", "source-related wording", "source_wording")
 
     return sources
 
@@ -231,32 +288,35 @@ def _error_result(url: str, status: str, exc: Exception) -> Dict[str, Any]:
 
 
 def check_source(source: Dict[str, Any]) -> Dict[str, Any]:
-    source_type = source["source_type"]
-    source_value = source["source"]
-
-    if source_type in ("url", "doi"):
-        result = _request_once(source_value)
-    elif source_type == "bare_domain":
-        if source_value.lower().startswith("https://"):
-            attempts = [source_value, f"http://{source_value[8:]}"]
-        elif source_value.lower().startswith("http://"):
-            attempts = [source_value, f"https://{source_value[7:]}"]
-        else:
-            attempts = [f"https://{source_value}", f"http://{source_value}"]
-        result = _request_once(attempts[0])
-        if result["level2_status"] not in ("accessible", "restricted_but_exists"):
-            result = _request_once(attempts[1])
-    else:
-        result = {
-            "level2_status": "not_checkable_text_only_source",
-            "http_status": None,
-            "attempt_url": None,
-            "final_url": None,
-            "error": None,
-        }
-
     checked = dict(source)
-    checked.update(result)
+    source_type = checked.get("source_type")
+    source_value = checked.get("source", "")
+
+    if source_type == "url":
+        result = _request_once(source_value)
+        checked.update(result)
+        checked.setdefault("reason", "")
+        return checked
+
+    if source_type == "doi":
+        result = _request_once(source_value)
+        checked.update(result)
+        checked.setdefault("reason", "")
+        return checked
+
+    if not checked.get("is_machine_checkable"):
+        checked.update(
+            {
+                "level2_status": "not_machine_checked_level1_signal",
+                "http_status": None,
+                "attempt_url": None,
+                "final_url": None,
+                "error": None,
+                "reason": checked.get("reason") or NOT_CHECKED_REASON,
+            }
+        )
+        return checked
+
     return checked
 
 
@@ -272,22 +332,30 @@ def verify_response(response: str, item_id: Optional[Any] = None, perform_level2
     failed_count = sum(
         1
         for source in sources
-        if source["level2_status"] not in ("accessible", "restricted_but_exists", "not_checkable_text_only_source")
+        if source.get("is_machine_checkable")
+        and source["level2_status"] not in ("accessible", "restricted_but_exists", "not_checked")
     )
-    url_count = sum(1 for source in sources if source["source_type"] in ("url", "bare_domain"))
+    machine_checkable_count = sum(1 for source in sources if source.get("is_machine_checkable"))
+    url_count = sum(1 for source in sources if source["source_type"] == "url")
     doi_count = sum(1 for source in sources if source["source_type"] == "doi")
-    text_only = has_words and not sources
+    bare_domain_count = sum(1 for source in sources if source["source_type"] == "bare_domain")
+    not_machine_checked_count = sum(1 for source in sources if not source.get("is_machine_checkable"))
+    text_only = has_words and not any(source["source_type"] != "source_wording" for source in sources)
 
     return {
         "item_id": item_id,
         "level1_status": "passed" if sources or has_words else "failed",
         "has_source_words": has_words,
         "source_count": len(sources),
+        "machine_checkable_count": machine_checkable_count,
         "url_count": url_count,
         "doi_count": doi_count,
+        "bare_domain_count": bare_domain_count,
         "text_only_source_reference": text_only,
         "accessible_count": accessible_count,
         "failed_count": failed_count,
+        "not_machine_checked_count": not_machine_checked_count,
+        "not_checked_count": not_machine_checked_count,
         "level3_status": "not_implemented",
         "level3_note": (
             "Level 3 claim-support verification is not implemented in this prototype. "
