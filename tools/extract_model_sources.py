@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Extract and deduplicate source references from the comparison dashboard."""
+"""Legacy manual source-inventory extractor.
+
+This is not the SourceCheck backend and should not be used as Level 2
+reachable/failed statistics. It extracts links, source names, platform names
+and source-field text from the dashboard for manual review only.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parent
-INPUT = ROOT / "三模型横向对比Dashboard_单文件版.html"
+INPUT_NAME = "GEN Y_项目门户与三模型Dashboard_单文件版.html"
+INPUT_CANDIDATES = [ROOT / INPUT_NAME, ROOT.parent / INPUT_NAME]
+INPUT = next((path for path in INPUT_CANDIDATES if path.exists()), INPUT_CANDIDATES[0])
 OUTPUT = ROOT / "三模型全部链接与数据来源核查清单.md"
 
 LEVEL_NAMES = {"P1": "简单版", "P2": "中等版", "P3": "难版"}
@@ -229,6 +236,8 @@ def main() -> None:
 
     lines = [
         "# 三模型全部链接与数据来源核查清单",
+        "",
+        "> Legacy manual source inventory. This file is generated from the older source extraction workflow and is not the current SourceCheck Level 2 reachable/failed result table. It may include HTTP links, HTTPS links, source names, platform names and source-field text. Do not use it as automated SourceCheck statistics.",
         "",
         f"- 来源文件：`{INPUT.name}`",
         f"- 覆盖范围：{cards} 组输出（GPT、Claude、DeepSeek；简单版、中等版、难版；SQ1-SQ6）",
